@@ -54,8 +54,11 @@ report = await gc_orphan_llm_cache(rag)              # report only
 report = await gc_orphan_llm_cache(rag, apply=True)  # delete the orphans
 ```
 
-CLI (env-driven construction — `WORKING_DIR`, `WORKSPACE`, `EMBEDDING_DIM`,
-`LIGHTRAG_*` storage selectors; never calls the LLM or embedder):
+CLI (env-driven construction — `WORKING_DIR`, `WORKSPACE`,
+`LIGHTRAG_KV_STORAGE` / `LIGHTRAG_GRAPH_STORAGE` /
+`LIGHTRAG_DOC_STATUS_STORAGE`, each backend's own connection variables, and
+`EMBEDDING_DIM`; the vector store is a no-op, and neither the LLM nor the
+embedder is ever called):
 
 ```bash
 python -m lightrag.tools.gc_llm_cache                    # report
@@ -74,10 +77,15 @@ KV stores, so a CLI run cannot see an ingestion happening in another process.
 ## Report
 
 ```
+Cache storage: PGKVStorage (workspace='acme')
 Cache rows: 412 (318 chunk-scoped, 94 without a chunk_id)
 Chunk-scoped: 311 live, 7 orphaned
 Report only — re-run with --apply to delete the orphans.
 ```
+
+The first line is what the CLI opened. A `LIGHTRAG_KV_STORAGE` the run did not
+notice would otherwise look exactly like an empty workspace, so the target is
+printed rather than inferred.
 
 The report carries a bounded key sample (`orphan_keys_sample`,
 `deleted_keys_sample` — 20 keys) so a large workspace cannot turn a dry run
@@ -87,6 +95,11 @@ A batch whose rows are still present after `delete` and
 `index_done_callback` raises instead of reporting a successful deletion:
 "deleted but still there" is the mirror image of the silent incomplete
 deletion this tool exists to fix.
+
+Deletion is per batch and not rolled back — a failure leaves the batches
+already deleted. Every liveness check runs before the first delete, so a read
+failure deletes nothing, and a sweep interrupted mid-way is completed by
+running it again: the rows that remain are still orphans.
 
 ## Backend support
 

@@ -240,3 +240,112 @@ async def test_key_enumeration_delegates_to_the_shared_backend_scan(monkeypatch)
 
     assert calls == [cache]
     assert report["orphan_rows"] == 1
+
+
+async def test_every_row_of_an_orphaned_chunk_is_deleted():
+    """One chunk can own several rows (extract and keywords). Deleting one row
+    per orphaned chunk would strand the rest."""
+    cache = FakeCacheKV(
+        {
+            "default:extract:aaa": _extract_row("chunk-gone"),
+            "default:keywords:bbb": {
+                **_extract_row("chunk-gone"),
+                "cache_type": "keywords",
+            },
+            "default:extract:ccc": _extract_row("chunk-live"),
+        }
+    )
+    chunks = FakeChunksKV({"chunk-live"})
+
+    report = await gc_orphan_llm_cache(_rag(cache, chunks), apply=True)
+
+    assert report["orphan_rows"] == 2
+    assert report["deleted_rows"] == 2
+    assert set(cache.rows) == {"default:extract:ccc"}
+
+
+async def test_the_cli_opens_the_backends_the_environment_names(monkeypatch, capsys):
+    """LightRAG's constructor defaults are file-backed, so a CLI that named no
+    storage classes would open a fresh local directory against a
+    ``LIGHTRAG_KV_STORAGE=PGKVStorage`` deployment and report it as empty: a
+    silent wrong answer, where a mismatch has to be visible instead."""
+    import lightrag
+
+    from lightrag.tools import gc_llm_cache
+
+    opened: dict[str, object] = {}
+
+    class _FakeRAG:
+        def __init__(self, **kwargs):
+            opened.update(kwargs)
+            self.workspace = kwargs.get("workspace")
+            self.llm_response_cache = FakeCacheKV({})
+            self.text_chunks = FakeChunksKV(set())
+
+        async def initialize_storages(self):
+            pass
+
+        async def finalize_storages(self):
+            pass
+
+    monkeypatch.setattr(lightrag, "LightRAG", _FakeRAG)
+    monkeypatch.setenv("LIGHTRAG_KV_STORAGE", "PGKVStorage")
+    monkeypatch.setenv("LIGHTRAG_GRAPH_STORAGE", "Neo4JStorage")
+    monkeypatch.setenv("LIGHTRAG_DOC_STATUS_STORAGE", "PGDocStatusStorage")
+    monkeypatch.setenv("WORKSPACE", "acme")
+
+    assert await gc_llm_cache._async_main(apply=False, batch_size=10, verbose=False)
+
+    assert opened["kv_storage"] == "PGKVStorage"
+    assert opened["graph_storage"] == "Neo4JStorage"
+    assert opened["doc_status_storage"] == "PGDocStatusStorage"
+    assert opened["workspace"] == "acme"
+    # The sweep never reads vectors, so the CLI must not build a real store.
+    assert opened["vector_storage"] == "NoopVectorDBStorage"
+    assert "Cache storage: FakeCacheKV" in capsys.readouterr().out
+
+
+async def test_a_scan_that_repeats_a_key_reports_the_row_once(monkeypatch):
+    """A repeated key used to be counted twice and "deleted" twice, so the
+    report stopped describing the namespace it claimed to describe."""
+
+    async def repeating_scan(kv):
+        return ["default:extract:aaa", "default:extract:aaa"]
+
+    import lightrag.tools.rebuild_vdb as rebuild_vdb
+
+    monkeypatch.setattr(rebuild_vdb, "enumerate_kv_keys", repeating_scan)
+
+    cache = FakeCacheKV({"default:extract:aaa": _extract_row("chunk-gone")})
+
+    report = await gc_orphan_llm_cache(_rag(cache, FakeChunksKV(set())), apply=True)
+
+    assert report["cache_rows"] == 1
+    assert report["orphan_rows"] == 1
+    assert report["deleted_rows"] == 1
+    assert cache.deleted == ["default:extract:aaa"]
+
+
+async def test_a_liveness_failure_deletes_nothing():
+    """Every liveness check runs before the first delete, so a chunks-namespace
+    failure must not leave a half-swept cache. The failure is injected on the
+    second batch of chunk ids, after the first has already been classified."""
+
+    class _BrokenChunks(FakeChunksKV):
+        async def filter_keys(self, keys):
+            raise ConnectionError("chunks namespace unreachable")
+
+    cache = FakeCacheKV(
+        {
+            "default:extract:aaa": _extract_row("chunk-gone-1"),
+            "default:extract:bbb": _extract_row("chunk-gone-2"),
+        }
+    )
+
+    with pytest.raises(ConnectionError):
+        await gc_orphan_llm_cache(
+            _rag(cache, _BrokenChunks(set())), apply=True, batch_size=1
+        )
+
+    assert cache.deleted == []
+    assert len(cache.rows) == 2

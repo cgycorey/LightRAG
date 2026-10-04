@@ -18,9 +18,14 @@ namespace, which is an offline-only, deliberate expense:
     report = await gc_orphan_llm_cache(rag)              # report only
     report = await gc_orphan_llm_cache(rag, apply=True)  # delete the orphans
 
-Usage (CLI — honors WORKING_DIR / WORKSPACE / LIGHTRAG_* storage env vars;
-server-backend deployments should prefer the library call from a small script
-wired to their own LightRAG construction):
+Usage — the CLI builds the storages the server's environment describes
+(``WORKING_DIR``, ``WORKSPACE``, ``LIGHTRAG_KV_STORAGE`` /
+``LIGHTRAG_GRAPH_STORAGE`` / ``LIGHTRAG_DOC_STATUS_STORAGE``, each backend's
+own connection variables) and prints the cache storage it opened, so a sweep
+against the wrong backend is visible instead of reported as an empty
+workspace. The vector store is a no-op because nothing here reads it. A
+deployment that builds its LightRAG another way should call
+``gc_orphan_llm_cache`` from a script wired to that construction:
 
     python -m lightrag.tools.gc_llm_cache [--apply] [--batch-size N] [--verbose]
 
@@ -39,6 +44,8 @@ Scope rules
 - Rows a document deletion deliberately retained count as dead here, because
   the chunk they name is gone. That is the operator's call, which is why the
   default is a report and ``--apply`` must be asked for.
+- A sweep that fails part-way is safe to re-run: deleted batches stay deleted
+  (nothing is restored), and the rows that remain are still orphans.
 
 Run it while the server is stopped. The shared pipeline status that would let
 a live process refuse the sweep is per-process for the file-backed KV stores,
@@ -69,10 +76,16 @@ async def _iter_key_batches(kv, batch_size: int) -> AsyncIterator[list[str]]:
     the key list, and the batches bound the row round trips that follow. The
     indirection is deliberate: when bounded KV iteration lands on
     ``BaseKVStorage``, this is the one function that has to change.
+
+    A key the scan repeats is collapsed: it would otherwise be counted twice
+    and "deleted" twice, so ``cache_rows`` and ``deleted_rows`` would stop
+    describing the namespace. Key identity belongs to the namespace, not to the
+    scan.
     """
     from lightrag.tools.rebuild_vdb import enumerate_kv_keys
 
     keys = await enumerate_kv_keys(kv)
+    keys = list(dict.fromkeys(keys))
     for start in range(0, len(keys), batch_size):
         yield keys[start : start + batch_size]
 
@@ -221,6 +234,17 @@ async def _async_main(apply: bool, batch_size: int, verbose: bool) -> bool:
     rag = LightRAG(
         working_dir=os.getenv("WORKING_DIR", "./rag_storage"),
         workspace=os.getenv("WORKSPACE", ""),
+        # The constructor's defaults are file-backed, so a server deployment's
+        # backends have to be named here or the sweep would open a fresh local
+        # directory and report an empty namespace instead of looking at the
+        # workspace the operator asked about. Vectors are only constructed,
+        # never read.
+        kv_storage=os.getenv("LIGHTRAG_KV_STORAGE", "JsonKVStorage"),
+        graph_storage=os.getenv("LIGHTRAG_GRAPH_STORAGE", "NetworkXStorage"),
+        doc_status_storage=os.getenv(
+            "LIGHTRAG_DOC_STATUS_STORAGE", "JsonDocStatusStorage"
+        ),
+        vector_storage="NoopVectorDBStorage",
         llm_model_func=_noop_llm,
         embedding_func=EmbeddingFunc(
             embedding_dim=int(os.getenv("EMBEDDING_DIM", "1024")),
@@ -231,6 +255,11 @@ async def _async_main(apply: bool, batch_size: int, verbose: bool) -> bool:
     await rag.initialize_storages()
     try:
         report = await gc_orphan_llm_cache(rag, apply=apply, batch_size=batch_size)
+        cache_kv = rag.llm_response_cache
+        print(
+            f"Cache storage: {type(cache_kv).__name__} "
+            f"(workspace={getattr(cache_kv, 'workspace', None)!r})"
+        )
         _print_report(report, verbose)
         return True
     finally:
