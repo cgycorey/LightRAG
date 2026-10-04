@@ -32,11 +32,12 @@ deployment that builds its LightRAG another way should call
 Scope rules
 -----------
 - Only rows carrying a non-empty ``chunk_id`` are candidates. Query and
-  keywords rows carry ``chunk_id=None`` by construction; they are another
-  tool's job (``lightrag-clean-llmqc``) and are never touched here. Rows from
-  before the field existed are equally out of scope: without a ``chunk_id``
-  there is no liveness question to ask, so deleting one could not be shown to
-  be safe.
+  keywords rows carry ``chunk_id=None`` by construction and belong to
+  ``lightrag-clean-llmqc``; the ``summary``, ``smartheading`` and ``analysis``
+  artifacts carry no chunk reference either, so no liveness question can be
+  asked about any of them. They are counted as ``unscoped_rows`` and left
+  alone: deleting a row a sweep cannot justify is how it loses data the
+  operator still wants. Rows predating the field are the same case.
 - A candidate is deleted only when ``text_chunks.filter_keys`` confirms its
   chunk no longer exists. A row whose chunk still exists is left alone even
   when no chunk references it: the owning document is alive, and deleting
@@ -107,8 +108,10 @@ async def gc_orphan_llm_cache(
         dict[str, Any]: counts and a bounded key sample:
         - ``cache_rows``: rows read from the cache namespace;
         - ``chunk_scoped_rows``: rows carrying a ``chunk_id`` (the candidates);
-        - ``unscoped_rows``: rows without one — query/keywords rows, and rows
-          predating the field — left to ``lightrag-clean-llmqc``;
+        - ``unscoped_rows``: rows without one — query/keywords answers
+          (``lightrag-clean-llmqc`` owns those), the summary/smartheading/
+          analysis artifacts that carry no chunk reference, and rows predating
+          the field — counted and left alone;
         - ``orphan_rows``: candidates whose chunk is missing;
         - ``live_rows``: candidates whose chunk still exists;
         - ``deleted_rows``: rows removed (``apply=True`` only);

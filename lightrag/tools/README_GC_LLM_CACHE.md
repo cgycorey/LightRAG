@@ -28,9 +28,13 @@ python -m lightrag.tools.gc_llm_cache --apply    # delete the orphans
 
 - **Only rows carrying a non-empty `chunk_id` are candidates.** Query and
   keywords rows carry `chunk_id=None` by construction; they are the job of
-  `lightrag-clean-llmqc` and are never touched here. Rows from before the
-  field existed are equally out of scope: without a `chunk_id` there is no
-  liveness question to ask, so deleting one could not be shown to be safe.
+  `lightrag-clean-llmqc` and are never touched here. The `summary`,
+  `smartheading` and multimodal `analysis` artifacts carry no chunk reference
+  either, so no liveness question can be asked about them: they are counted as
+  `unscoped_rows` and left alone. A chunk-liveness sweep cannot reach them at
+  all — naming them would need the opposite rule (delete what no live chunk
+  references), which this tool deliberately does not implement. Rows from
+  before the field existed are the same case.
 - **A candidate is deleted only when `text_chunks.filter_keys` confirms its
   chunk no longer exists.** A row whose chunk still exists is left alone even
   when no chunk references it: its owning document is alive, and deleting it

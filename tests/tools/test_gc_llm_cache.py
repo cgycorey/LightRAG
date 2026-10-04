@@ -133,16 +133,30 @@ async def test_apply_deletes_only_the_orphans_and_commits():
     assert cache.commits == 1
 
 
-async def test_query_rows_are_never_candidates():
-    """Query/keywords rows carry no chunk_id; another tool owns them."""
+async def test_rows_without_a_chunk_id_are_never_candidates():
+    """Query/keywords answers belong to ``lightrag-clean-llmqc``, and the
+    summary/smartheading/analysis artifacts carry no chunk reference at all, so
+    no liveness question can be asked about any of them. They are counted and
+    left alone: deleting what the sweep cannot justify is how it loses data
+    the operator still wants."""
     cache = FakeCacheKV(
-        {"local:query:aaa": _query_row(), "local:keywords:bbb": _query_row()}
+        {
+            "local:query:aaa": _query_row(),
+            "local:keywords:bbb": _query_row(),
+            "default:summary:ccc": {**_query_row(), "cache_type": "summary"},
+            "default:smartheading:ddd": {
+                **_query_row(),
+                "cache_type": "smartheading",
+            },
+            "default:analysis:eee": {**_query_row(), "cache_type": "analysis"},
+        }
     )
     chunks = FakeChunksKV(set())
 
     report = await gc_orphan_llm_cache(_rag(cache, chunks), apply=True)
 
-    assert report["unscoped_rows"] == 2
+    assert report["unscoped_rows"] == 5
+    assert report["chunk_scoped_rows"] == 0
     assert report["orphan_rows"] == 0
     assert cache.deleted == []
     # Nothing chunk-scoped was seen, so liveness was never asked.
