@@ -37,11 +37,19 @@ Scope rules
   artifacts carry no chunk reference either, so no liveness question can be
   asked about any of them. They are counted as ``unscoped_rows`` and left
   alone: deleting a row a sweep cannot justify is how it loses data the
-  operator still wants. Rows predating the field are the same case.
-- A candidate is deleted only when ``text_chunks.filter_keys`` confirms its
-  chunk no longer exists. A row whose chunk still exists is left alone even
-  when no chunk references it: the owning document is alive, and deleting
-  the row would re-bill its next reprocess for nothing.
+  operator still wants. A document deletion still reclaims ``smartheading``
+  and multimodal ``analysis`` rows through its own pool; only ``summary`` has
+  no deletion path at all. Rows predating the field are the same case.
+- A candidate is deleted only once its chunk's absence is *confirmed*:
+  ``text_chunks.get_by_id_strict`` answers ``None`` for that chunk. The bulk
+  ``filter_keys`` answer is only a candidate filter, because it fails open on
+  a backend whose index is not ready (OpenSearch reports every key absent),
+  which would empty the cache. A backend without
+  ``supports_strict_point_reads`` is refused, and a strict read that cannot
+  confirm absence aborts the sweep before the first delete.
+- A row whose chunk still exists is left alone even when no chunk references
+  it: its owning document is alive, and deleting the row would re-bill the
+  next reprocess for nothing.
 - Rows a document deletion deliberately retained count as dead here, because
   the chunk they name is gone. That is the operator's call, which is why the
   default is a report and ``--apply`` must be asked for.
@@ -119,10 +127,18 @@ async def gc_orphan_llm_cache(
           ``SAMPLE_LIMIT`` keys, for the operator to eyeball.
 
     Raises:
-        ValueError: ``batch_size`` is below 1, or the cache / text-chunks
-            storage is not configured.
+        ValueError: ``batch_size`` is below 1, the cache / text-chunks storage
+            is not configured, or the chunks backend cannot confirm absence
+            (``supports_strict_point_reads`` is false).
         RuntimeError: A batch reported success but its rows are still present,
-            so the sweep did not actually delete what it said it did.
+            so the sweep did not actually delete what it said it did. Where a
+            backend stages deletes (OpenSearch) a tombstone that a retryable
+            flush failure left buffered still reads as absent, so in that case
+            the check proves acceptance rather than publication; the storage's
+            own ``finalize()`` raises when operations remain buffered, but
+            ``LightRAG.finalize_storages()`` logs a per-storage failure instead
+            of re-raising, so the count can be printed with the CLI still
+            exiting 0.
     """
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
@@ -165,12 +181,46 @@ async def gc_orphan_llm_cache(
             report["chunk_scoped_rows"] += 1
             scoped.setdefault(chunk_id, []).append(key)
 
-    orphan_ids: list[str] = []
+    # A "missing" answer from ``filter_keys`` is only a candidate: that read
+    # fails open on a backend whose index is not ready (OpenSearch reports
+    # every key absent), which would make every chunk-scoped row an orphan and
+    # let ``--apply`` empty the cache. Absence is therefore confirmed one id at
+    # a time, and a backend that cannot answer that way is not swept at all.
+    if not getattr(chunks_kv, "supports_strict_point_reads", False):
+        raise ValueError(
+            f"{type(chunks_kv).__name__} cannot confirm that a chunk is absent "
+            "(supports_strict_point_reads=False); refusing to delete cache "
+            "rows on an unconfirmed miss"
+        )
+
+    candidates: list[str] = []
     chunk_ids = sorted(scoped)
     for start in range(0, len(chunk_ids), batch_size):
         batch_ids = chunk_ids[start : start + batch_size]
         missing = await chunks_kv.filter_keys(set(batch_ids))
-        orphan_ids.extend(chunk_id for chunk_id in batch_ids if chunk_id in missing)
+        candidates.extend(chunk_id for chunk_id in batch_ids if chunk_id in missing)
+
+    orphan_ids: list[str] = []
+    misread = 0
+    for start in range(0, len(candidates), batch_size):
+        batch_ids = candidates[start : start + batch_size]
+        # ``None`` is confirmed absence. Anything else is a chunk that exists
+        # (the bulk read was wrong about it), and an exception means absence
+        # could not be confirmed: that aborts the sweep here, before the first
+        # delete, with nothing removed.
+        confirmed = await asyncio.gather(
+            *(chunks_kv.get_by_id_strict(chunk_id) for chunk_id in batch_ids)
+        )
+        for chunk_id, row in zip(batch_ids, confirmed):
+            if row is None:
+                orphan_ids.append(chunk_id)
+            else:
+                misread += 1
+    if misread:
+        logger.warning(
+            f"[gc-llm-cache] {type(chunks_kv).__name__} reported {misread} "
+            "existing chunk(s) as absent; they were confirmed present and kept"
+        )
 
     orphan_keys = [key for chunk_id in orphan_ids for key in scoped[chunk_id]]
     report["orphan_rows"] = len(orphan_keys)
@@ -222,7 +272,7 @@ def _print_report(report: dict[str, Any], verbose: bool) -> None:
             print(f"  orphan: {key}")
 
 
-async def _async_main(apply: bool, batch_size: int, verbose: bool) -> bool:
+async def _async_main(apply: bool, batch_size: int, verbose: bool) -> None:
     import numpy as np
 
     from lightrag import LightRAG
@@ -257,14 +307,15 @@ async def _async_main(apply: bool, batch_size: int, verbose: bool) -> bool:
     )
     await rag.initialize_storages()
     try:
-        report = await gc_orphan_llm_cache(rag, apply=apply, batch_size=batch_size)
+        # Printed before the sweep: a run that aborts still has to say which
+        # backend it opened.
         cache_kv = rag.llm_response_cache
         print(
             f"Cache storage: {type(cache_kv).__name__} "
             f"(workspace={getattr(cache_kv, 'workspace', None)!r})"
         )
+        report = await gc_orphan_llm_cache(rag, apply=apply, batch_size=batch_size)
         _print_report(report, verbose)
-        return True
     finally:
         await rag.finalize_storages()
 
@@ -292,11 +343,9 @@ def main() -> None:
         "--verbose", action="store_true", help="Print a sample of orphaned keys"
     )
     args = parser.parse_args()
-    ok = asyncio.run(
+    asyncio.run(
         _async_main(apply=args.apply, batch_size=args.batch_size, verbose=args.verbose)
     )
-    if not ok:
-        raise SystemExit(1)
 
 
 if __name__ == "__main__":
