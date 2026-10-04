@@ -1,0 +1,98 @@
+# Orphaned LLM Cache GC
+
+Operator-invoked cleanup for cache rows a document deletion could not reach.
+
+`delete_llm_cache=True` removes a document's LLM cache rows by following the
+`llm_cache_list` each chunk carries. A row whose key was never attached to its
+chunk is invisible to that path: the chunks are deleted, the deletion reports
+`success`, and the row stays. The row holds the extraction prompt — the chunk
+text verbatim — plus the extracted entities and relations, so a stranded row
+is an incomplete-deletion residue rather than housekeeping.
+
+The write ordering that lands with the recovery-anchor work closes the window
+on **new** data: a cache row is written only after its reference is recorded,
+and the write is skipped when the reference cannot be recorded. What remains
+are rows written before that ordering, and rows a hard kill lost mid-flight.
+
+Recovery cannot see either set — the only other reader of a cache row's
+`chunk_id` is a filtered scan, which is unaffordable on every document
+deletion and unavailable on Redis. So the sweep is a deliberate, offline,
+operator-invoked operation:
+
+```bash
+python -m lightrag.tools.gc_llm_cache            # report
+python -m lightrag.tools.gc_llm_cache --apply    # delete the orphans
+```
+
+## Scope rules
+
+- **Only rows carrying a non-empty `chunk_id` are candidates.** Query and
+  keywords rows carry `chunk_id=None` by construction; they are the job of
+  `lightrag-clean-llmqc` and are never touched here. Rows from before the
+  field existed are equally out of scope: without a `chunk_id` there is no
+  liveness question to ask, so deleting one could not be shown to be safe.
+- **A candidate is deleted only when `text_chunks.filter_keys` confirms its
+  chunk no longer exists.** A row whose chunk still exists is left alone even
+  when no chunk references it: its owning document is alive, and deleting it
+  would only re-bill the next reprocess.
+- **Rows a document deletion deliberately retained count as dead**, because
+  the chunk they name is gone. `delete_llm_cache=False` keeps extraction cache
+  rows so a re-ingest is cheap; a sweep deletes them. That trade is the
+  operator's call, which is why the default is a report and `--apply` must be
+  asked for.
+
+## Usage
+
+Library (works with every configured backend combination):
+
+```python
+from lightrag.tools.gc_llm_cache import gc_orphan_llm_cache
+
+rag = LightRAG(...)
+await rag.initialize_storages()
+report = await gc_orphan_llm_cache(rag)              # report only
+report = await gc_orphan_llm_cache(rag, apply=True)  # delete the orphans
+```
+
+CLI (env-driven construction — `WORKING_DIR`, `WORKSPACE`, `EMBEDDING_DIM`,
+`LIGHTRAG_*` storage selectors; never calls the LLM or embedder):
+
+```bash
+python -m lightrag.tools.gc_llm_cache                    # report
+python -m lightrag.tools.gc_llm_cache --apply            # delete
+python -m lightrag.tools.gc_llm_cache --verbose          # sample keys
+python -m lightrag.tools.gc_llm_cache --batch-size 1000  # storage round trips
+```
+
+A sweep is a full namespace read (keys are materialized by the shared
+per-backend scan; rows are fetched and deleted in batches) plus one
+`filter_keys` call per batch of distinct chunk ids. Like the other offline
+tools, run it while the server is stopped: the shared pipeline status that
+would let a live process notice the sweep is per-process for the file-backed
+KV stores, so a CLI run cannot see an ingestion happening in another process.
+
+## Report
+
+```
+Cache rows: 412 (318 chunk-scoped, 94 without a chunk_id)
+Chunk-scoped: 311 live, 7 orphaned
+Report only — re-run with --apply to delete the orphans.
+```
+
+The report carries a bounded key sample (`orphan_keys_sample`,
+`deleted_keys_sample` — 20 keys) so a large workspace cannot turn a dry run
+into an unbounded print. Counts are exact either way.
+
+A batch whose rows are still present after `delete` and
+`index_done_callback` raises instead of reporting a successful deletion:
+"deleted but still there" is the mirror image of the silent incomplete
+deletion this tool exists to fix.
+
+## Backend support
+
+Key enumeration is not part of `BaseKVStorage` yet. The sweep uses the same
+per-backend scans as the other offline tools — `JsonKVStorage`,
+`RedisKVStorage`, `PGKVStorage`, `MongoKVStorage`, `OpenSearchKVStorage` — and
+refuses with a clear error on a backend it cannot list. When bounded KV
+iteration reaches `BaseKVStorage`, `_iter_key_batches` in the tool is the one
+function that has to change.
